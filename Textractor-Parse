@@ -1,0 +1,699 @@
+import json
+import boto3
+import os
+import time
+import re
+from datetime import datetime
+
+# Environment variables instead of hard-coded values
+INPUT_BUCKET = os.environ.get('INPUT_BUCKET')
+INPUT_PREFIX = os.environ.get('INPUT_PREFIX', 'input/')
+OUTPUT_BUCKET = os.environ.get('OUTPUT_BUCKET')
+OUTPUT_PREFIX = os.environ.get('OUTPUT_PREFIX', 'output/')
+MAX_WAIT_TIME = int(os.environ.get('MAX_WAIT_TIME', 600))  # 10 minutes default
+
+# Flag to control inclusion of confidence scores in the JSON output
+INCLUDE_CONFIDENCE_SCORES = os.environ.get('INCLUDE_CONFIDENCE_SCORES', 'True').lower() == 'true'
+
+# Initialize AWS clients outside the handler for reuse across invocations
+s3_client = boto3.client('s3')
+textract_client = boto3.client('textract')
+
+def lambda_handler(event, context):
+    """
+    Lambda function that processes PDF files and images from S3 input path and stores results in S3 output path
+    with enhanced document structure preservation for LLM ingestion in JSON format
+    """
+    try:
+        # Get document source from event
+        bucket, key = extract_bucket_and_key(event)
+        if not bucket or not key:
+            return {
+                'statusCode': 400,
+                'body': 'Missing document information in the event'
+            }
+            
+        print(f"Processing document s3://{bucket}/{key}")
+        
+        # Process the document with Textract
+        document = process_document(bucket, key)
+        
+        # Generate base output key for all output files
+        base_output_key = generate_base_output_key(key)
+        
+        # Ensure OUTPUT_PREFIX ends with a slash
+        output_prefix = OUTPUT_PREFIX
+        if output_prefix and not output_prefix.endswith('/'):
+            output_prefix += '/'
+            
+        # 1. Save original Textract JSON response
+        textract_json_key = f"{output_prefix}{base_output_key}.json"
+        s3_client.put_object(
+            Bucket=OUTPUT_BUCKET,
+            Key=textract_json_key,
+            Body=json.dumps(document['textract_json']),
+            ContentType='application/json; charset=utf-8'
+        )
+        print(f"Original Textract JSON saved to s3://{OUTPUT_BUCKET}/{textract_json_key}")
+        
+        # 2. Create and save LLM-ready JSON with key content
+        llm_json_content = create_llm_ready_json(document, include_confidence=INCLUDE_CONFIDENCE_SCORES)
+        llm_json_key = f"{output_prefix}{base_output_key}-llm.json"
+        s3_client.put_object(
+            Bucket=OUTPUT_BUCKET,
+            Key=llm_json_key,
+            Body=json.dumps(llm_json_content, indent=2),
+            ContentType='application/json; charset=utf-8'
+        )
+        print(f"LLM-ready JSON saved to s3://{OUTPUT_BUCKET}/{llm_json_key}")
+        
+        return {
+            'statusCode': 200,
+            'body': {
+                'message': 'Document processed successfully with JSON output',
+                'source': f"s3://{bucket}/{key}",
+                'outputs': {
+                    'textract_json': f"s3://{OUTPUT_BUCKET}/{textract_json_key}",
+                    'llm_json': f"s3://{OUTPUT_BUCKET}/{llm_json_key}"
+                }
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': f"Error processing document: {str(e)}"
+        }
+
+def extract_bucket_and_key(event):
+    """Extract bucket and key from various event formats"""
+    if 'Records' in event and len(event['Records']) > 0:
+        # S3 trigger event
+        bucket = event['Records'][0]['s3']['bucket']['name']
+        key = event['Records'][0]['s3']['object']['key']
+        return bucket, key
+    elif 'bucket' in event and 'key' in event:
+        # Direct invocation with bucket and key
+        return event['bucket'], event['key']
+    else:
+        return None, None
+
+def process_document(bucket, key):
+    """Process document with appropriate Textract API based on file type"""
+    # Check if the document is a PDF
+    if key.lower().endswith('.pdf'):
+        try:
+            # First try synchronous API (works for single-page PDFs)
+            print("Attempting synchronous processing...")
+            response = textract_client.analyze_document(
+                Document={
+                    'S3Object': {
+                        'Bucket': bucket,
+                        'Name': key
+                    }
+                },
+                FeatureTypes=['TABLES', 'FORMS', 'LAYOUT']
+            )
+            return process_textract_response(response)
+        except Exception as e:
+            if "UnsupportedDocumentException" in str(e):
+                # If synchronous API fails, use asynchronous API for multi-page PDFs
+                print("Detected multi-page PDF, switching to asynchronous processing")
+                
+                # Start asynchronous job
+                response = textract_client.start_document_analysis(
+                    DocumentLocation={
+                        'S3Object': {
+                            'Bucket': bucket,
+                            'Name': key
+                        }
+                    },
+                    FeatureTypes=['TABLES', 'FORMS', 'LAYOUT']
+                )
+                
+                job_id = response['JobId']
+                print(f"Started asynchronous Textract job with ID: {job_id}")
+                
+                # Wait for the job to complete
+                wait_for_job_completion(job_id)
+                
+                # Get the results
+                print(f"Job {job_id} completed, retrieving results")
+                return process_asynchronous_response(job_id)
+            else:
+                # If it's a different error, re-raise it
+                raise
+    else:
+        # For images, use synchronous API
+        response = textract_client.analyze_document(
+            Document={
+                'S3Object': {
+                    'Bucket': bucket,
+                    'Name': key
+                }
+            },
+            FeatureTypes=['TABLES', 'FORMS', 'LAYOUT']
+        )
+        return process_textract_response(response)
+
+def process_textract_response(response):
+    """Process the Textract response (synchronous API)"""
+    document = {
+        'pages': [],
+        'forms': [],
+        'tables': [],
+        'textract_json': response
+    }
+    
+    # Create blocks map for easy lookup
+    blocks_map = {block['Id']: block for block in response['Blocks']}
+    
+    # Extract text by page
+    current_page = {'text': '', 'page_num': 1}
+    document['pages'].append(current_page)
+    
+    # Process blocks to extract text, forms, and tables
+    for block in response['Blocks']:
+        # Extract page text
+        if block['BlockType'] == 'LINE':
+            current_page['text'] += block['Text'] + "\n"
+    
+    # Extract forms (key-value pairs)
+    document['forms'] = extract_forms(response['Blocks'], blocks_map)
+    
+    # Extract tables
+    document['tables'] = extract_tables(response['Blocks'], blocks_map)
+    
+    return document
+
+def process_asynchronous_response(job_id):
+    """Process the asynchronous Textract response"""
+    document = {
+        'pages': [],
+        'forms': [],
+        'tables': [],
+        'textract_json': {'Blocks': []}
+    }
+    
+    # Get all pages of results
+    blocks = []
+    next_token = None
+    
+    while True:
+        if next_token:
+            response = textract_client.get_document_analysis(
+                JobId=job_id,
+                NextToken=next_token
+            )
+        else:
+            response = textract_client.get_document_analysis(
+                JobId=job_id
+            )
+        
+        # Collect blocks
+        blocks.extend(response['Blocks'])
+        document['textract_json']['Blocks'].extend(response['Blocks'])
+        
+        # Check if there are more results
+        if 'NextToken' in response:
+            next_token = response['NextToken']
+        else:
+            break
+    
+    # Create blocks map for easy lookup
+    blocks_map = {block['Id']: block for block in blocks}
+    
+    # Extract text by page
+    current_page = None
+    for block in blocks:
+        if block['BlockType'] == 'PAGE':
+            # Create a new page
+            current_page = {'text': '', 'page_num': block.get('Page', len(document['pages']) + 1)}
+            document['pages'].append(current_page)
+        
+        # Collect text for the current page
+        if block['BlockType'] == 'LINE' and current_page:
+            current_page['text'] += block['Text'] + "\n"
+    
+    # Extract forms (key-value pairs)
+    document['forms'] = extract_forms(blocks, blocks_map)
+    
+    # Extract tables
+    document['tables'] = extract_tables(blocks, blocks_map)
+    
+    return document
+
+def extract_forms(blocks, blocks_map):
+    """Extract form key-value pairs from Textract blocks"""
+    forms = []
+    
+    # Map key-value sets
+    key_map = {}
+    value_map = {}
+    
+    for block in blocks:
+        if block['BlockType'] == 'KEY_VALUE_SET':
+            if 'EntityTypes' in block and 'KEY' in block['EntityTypes']:
+                key_map[block['Id']] = block
+            elif 'EntityTypes' in block and 'VALUE' in block['EntityTypes']:
+                value_map[block['Id']] = block
+    
+    # Link keys to values
+    for key_id, key_block in key_map.items():
+        value_block = find_value_block(key_block, value_map)
+        if value_block:
+            key_text = get_text_from_block(key_block, blocks_map)
+            value_text = get_text_from_block(value_block, blocks_map)
+            
+            # Skip if key is empty
+            if not key_text.strip():
+                continue
+                
+            # Fix incomplete sentences by checking for common cut-off patterns
+            value_text = fix_incomplete_sentences(value_text)
+            
+            # Add confidence score
+            key_confidence = key_block.get('Confidence', 100)
+            value_confidence = value_block.get('Confidence', 100)
+            confidence = min(key_confidence, value_confidence)
+            
+            forms.append({
+                'key': {'text': key_text, 'confidence': key_confidence},
+                'value': {'text': value_text, 'confidence': value_confidence},
+                'confidence': confidence
+            })
+    
+    return forms
+
+def fix_incomplete_sentences(text):
+    """Fix incomplete sentences by checking for common patterns"""
+    # List of common sentence endings
+    endings = ['.', '!', '?', ':', ';']
+    
+    # Check if text ends with a conjunction or preposition
+    conjunctions = ['and', 'or', 'but', 'nor', 'so', 'yet', 'for', 'with', 'to', 'from', 'by', 'at', 'in', 'on', 'of', 'which', 'include']
+    
+    # If text ends with a conjunction, try to find the complete sentence
+    for conj in conjunctions:
+        if text.strip().lower().endswith(conj):
+            return text.strip()  # Return without ellipsis to avoid confusion
+    
+    # Check if text ends with a percentage or number without proper context
+    if re.search(r'(\d+(\.\d+)?%?|\d+(\.\d+)?)$', text.strip()):
+        return text.strip()  # Return without ellipsis
+    
+    return text.strip()
+
+def extract_tables(blocks, blocks_map):
+    """Extract tables from Textract blocks with improved multi-row cell handling"""
+    tables = []
+    
+    for block in blocks:
+        if block['BlockType'] == 'TABLE':
+            table = extract_table_with_merged_cells(block, blocks_map)
+            if table:
+                tables.append(table)
+    
+    return tables
+
+def extract_table_with_merged_cells(table_block, blocks_map):
+    """Extract a table from a table block with support for merged cells"""
+    if 'Relationships' not in table_block:
+        return None
+    
+    # Get all cells
+    cells = []
+    for relationship in table_block['Relationships']:
+        if relationship['Type'] == 'CHILD':
+            for cell_id in relationship['Ids']:
+                if cell_id in blocks_map:
+                    cell_block = blocks_map[cell_id]
+                    if cell_block['BlockType'] == 'CELL':
+                        cells.append(cell_block)
+    
+    if not cells:
+        return None
+    
+    # Determine table dimensions
+    max_row = 0
+    max_col = 0
+    
+    for cell in cells:
+        if 'RowIndex' in cell and cell['RowIndex'] > max_row:
+            max_row = cell['RowIndex']
+        if 'ColumnIndex' in cell and cell['ColumnIndex'] > max_col:
+            max_col = cell['ColumnIndex']
+    
+    # Get table confidence
+    table_confidence = table_block.get('Confidence', 100)
+    
+    # Create table structure
+    table = {
+        'tableId': table_block['Id'],
+        'confidence': table_confidence,
+        'rows': [],
+        'num_rows': max_row,
+        'num_cols': max_col
+    }
+    
+    # Initialize rows with empty cells
+    for i in range(max_row):
+        row = {
+            'confidence': None,  # Will calculate this based on cell confidences
+            'cells': [{'text': '', 'confidence': 0, 'rowspan': 1, 'colspan': 1} for _ in range(max_col)]
+        }
+        table['rows'].append(row)
+    
+    # Fill in cell content and detect merged cells
+    cell_map = {}  # Map of (row, col) to cell
+    
+    for cell in cells:
+        if 'RowIndex' in cell and 'ColumnIndex' in cell:
+            row_idx = cell['RowIndex'] - 1  # 0-based index
+            col_idx = cell['ColumnIndex'] - 1  # 0-based index
+            
+            if 0 <= row_idx < max_row and 0 <= col_idx < max_col:
+                cell_text = get_text_from_block(cell, blocks_map)
+                cell_confidence = cell.get('Confidence', 100)
+                rowspan = cell.get('RowSpan', 1)
+                colspan = cell.get('ColumnSpan', 1)
+                
+                # Store the cell in our map
+                cell_map[(row_idx, col_idx)] = {
+                    'text': cell_text,
+                    'confidence': cell_confidence,
+                    'rowspan': rowspan,
+                    'colspan': colspan
+                }
+                
+                # Update the table structure
+                table['rows'][row_idx]['cells'][col_idx] = {
+                    'text': cell_text,
+                    'confidence': cell_confidence,
+                    'rowspan': rowspan,
+                    'colspan': colspan
+                }
+                
+                # Mark cells that are spanned by this cell
+                if rowspan > 1 or colspan > 1:
+                    for r in range(row_idx, min(row_idx + rowspan, max_row)):
+                        for c in range(col_idx, min(col_idx + colspan, max_col)):
+                            if r != row_idx or c != col_idx:  # Skip the main cell
+                                table['rows'][r]['cells'][c]['spanned'] = True
+                                table['rows'][r]['cells'][c]['spanned_by'] = (row_idx, col_idx)
+    
+    # Calculate row confidence as average of cell confidences
+    for row in table['rows']:
+        valid_cells = [cell for cell in row['cells'] if not ('spanned' in cell and cell['spanned'])]
+        if valid_cells:
+            row['confidence'] = sum(cell['confidence'] for cell in valid_cells) / len(valid_cells)
+        else:
+            row['confidence'] = 0
+    
+    return table
+
+def find_value_block(key_block, value_map):
+    """Find the value block associated with a key block"""
+    if 'Relationships' not in key_block:
+        return None
+    
+    for relationship in key_block['Relationships']:
+        if relationship['Type'] == 'VALUE':
+            for value_id in relationship['Ids']:
+                if value_id in value_map:
+                    return value_map[value_id]
+    
+    return None
+
+def get_text_from_block(block, blocks_map):
+    """Extract text from a block using its relationships"""
+    text = ""
+    
+    if 'Relationships' not in block:
+        return text
+    
+    for relationship in block['Relationships']:
+        if relationship['Type'] == 'CHILD':
+            for child_id in relationship['Ids']:
+                if child_id in blocks_map:
+                    child_block = blocks_map[child_id]
+                    if child_block['BlockType'] == 'WORD':
+                        text += child_block['Text'] + " "
+                    elif child_block['BlockType'] == 'SELECTION_ELEMENT':
+                        if child_block['SelectionStatus'] == 'SELECTED':
+                            text += "X "
+    
+    return text.strip()
+
+def wait_for_job_completion(job_id, max_wait_time=MAX_WAIT_TIME):
+    """Wait for an asynchronous Textract job to complete"""
+    start_time = time.time()
+    print(f"Waiting for job {job_id} to complete...")
+    
+    while time.time() - start_time < max_wait_time:
+        response = textract_client.get_document_analysis(JobId=job_id)
+        status = response['JobStatus']
+        
+        print(f"Job status: {status}")
+        
+        if status == 'SUCCEEDED':
+            return True
+        elif status == 'FAILED':
+            raise Exception(f"Textract job failed: {response.get('StatusMessage', 'Unknown error')}")
+        
+        # Wait before checking again
+        time.sleep(5)
+    
+    raise Exception(f"Textract job timed out after {max_wait_time} seconds")
+
+def generate_base_output_key(input_key):
+    """Generate base output key based on input key and timestamp"""
+    base_name = os.path.splitext(os.path.basename(input_key))[0]
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{base_name}-{timestamp}"
+
+def detect_document_type(document):
+    """Detect document type based on content analysis"""
+    # Try to extract the title from the first few lines
+    if document['pages'] and document['pages'][0]['text']:
+        lines = document['pages'][0]['text'].strip().split('\n')
+        if lines and len(lines) > 0:
+            potential_title = lines[0].strip()
+            if potential_title and len(potential_title) < 100:  # Reasonable title length
+                return potential_title
+    
+    # Default to generic document type
+    return "Document"
+
+def parse_numeric_values(text):
+    """Parse numeric values from text, handling various formats"""
+    # Try to extract numeric values (including those with commas and decimals)
+    values = re.findall(r'\b\d+(?:,\d+)*(?:\.\d+)?\b', text)
+    
+    # Convert to clean format
+    clean_values = []
+    for val in values:
+        # Remove commas
+        clean_val = val.replace(',', '')
+        clean_values.append(clean_val)
+    
+    return clean_values if clean_values else [text]
+
+def get_column_names_from_tables(tables):
+    """Extract column names from tables for use in parsing totals"""
+    column_names = []
+    
+    # Look for tables with numeric columns
+    for table in tables:
+        if table['rows'] and len(table['rows']) > 0:
+            first_row = table['rows'][0]
+            
+            # Check each cell in the first row
+            for cell in first_row['cells']:
+                cell_text = cell['text'].strip()
+                
+                # Look for financial column headers
+                lower_text = cell_text.lower()
+                if any(term in lower_text for term in ['amount', 'balance', 'total', 'credit', 'debit', 'price', 'cost', 'value', 'rs.', 'inr', '$']):
+                    column_names.append(cell_text)
+    
+    # If we didn't find any specific column names, use generic ones
+    if not column_names:
+        column_names = ["Count", "Amount", "Credit", "Debit", "Balance"]
+    
+    return column_names
+
+def create_llm_ready_json(document, include_confidence=True):
+    """
+    Creates a simplified JSON structure with key content from Textract output
+    that's optimized for LLM consumption
+    
+    Parameters:
+    - document: The processed document with extracted text, forms, and tables
+    - include_confidence: Flag to determine whether confidence scores should be included
+    """
+    # Detect document type
+    doc_type = detect_document_type(document)
+    
+    # Add metadata about confidence scores to help downstream consumers
+    llm_json = {
+        "metadata": {
+            "documentType": doc_type,
+            "pages": len(document['pages']),
+            "processedDate": datetime.now().strftime('%Y-%m-%d'),
+            "includesConfidenceScores": include_confidence
+        },
+        "content": [],
+        "keyInformation": [],
+        "tables": []
+    }
+    
+    # Add page content
+    for page in document['pages']:
+        page_content = {
+            "pageNumber": page.get('page_num', 1),
+            "text": page.get('text', "")
+        }
+        llm_json["content"].append(page_content)
+    
+    # Add key-value pairs from forms (skip empty values)
+    for form in document['forms']:
+        key_text = form['key']['text']
+        value_text = form['value']['text']
+        
+        # Skip empty values
+        if not value_text.strip():
+            continue
+            
+        # Create key-value pair with or without confidence
+        kv_pair = {
+            "key": key_text,
+            "value": value_text
+        }
+        
+        # Add confidence score if flag is set
+        if include_confidence:
+            confidence = form.get('confidence', 100)
+            kv_pair["confidence"] = confidence
+            
+        # Special handling for "Total" fields to parse numeric values
+        if key_text.lower() == 'total' and any(char.isdigit() for char in value_text):
+            values = parse_numeric_values(value_text)
+            
+            # If we have multiple values, create separate entries
+            if len(values) > 1:
+                # Add the first value with the original key
+                first_kv = kv_pair.copy()
+                first_kv["value"] = values[0]
+                llm_json["keyInformation"].append(first_kv)
+                
+                # Try to determine column names for the remaining values
+                column_names = get_column_names_from_tables(document['tables'])
+                
+                # Add remaining values with appropriate column names
+                for i, value in enumerate(values[1:], 1):
+                    column_key = column_names[i-1] if i <= len(column_names) else f"Column {i}"
+                    additional_kv = {
+                        "key": f"Total {column_key}",
+                        "value": value
+                    }
+                    if include_confidence:
+                        additional_kv["confidence"] = confidence
+                    llm_json["keyInformation"].append(additional_kv)
+            else:
+                # Just one value, add it normally
+                llm_json["keyInformation"].append(kv_pair)
+        else:
+            # Regular key-value pair
+            llm_json["keyInformation"].append(kv_pair)
+    
+    # Add tables with proper structure
+    for table_idx, table in enumerate(document['tables'], 1):
+        table_data = {
+            "tableId": table_idx,
+            "headers": [],
+            "rows": []
+        }
+        
+        # Add table confidence if flag is set
+        if include_confidence and 'confidence' in table:
+            table_data["confidence"] = table.get('confidence', 100)
+        
+        # Extract headers from first row
+        if table['rows'] and len(table['rows']) > 0:
+            first_row = table['rows'][0]
+            headers = []
+            
+            for cell in first_row['cells']:
+                if 'spanned' in cell and cell['spanned']:
+                    # This cell is part of a span, skip it
+                    continue
+                
+                if include_confidence:
+                    headers.append({
+                        "text": cell['text'],
+                        "confidence": cell.get('confidence', 100)
+                    })
+                else:
+                    headers.append(cell['text'])
+            
+            table_data["headers"] = headers
+        
+        # Extract data rows (skip header row)
+        for row_idx in range(1, len(table['rows'])):
+            row = table['rows'][row_idx]
+            
+            # Create row structure based on confidence flag
+            if include_confidence:
+                row_data = {
+                    "confidence": row.get('confidence', 100),
+                    "cells": []
+                }
+            else:
+                row_data = []
+            
+            for cell_idx, cell in enumerate(row['cells']):
+                if 'spanned' in cell and cell['spanned']:
+                    # This cell is part of a span, skip it
+                    continue
+                
+                if cell['rowspan'] > 1 or cell['colspan'] > 1:
+                    # This is a merged cell
+                    if include_confidence:
+                        cell_data = {
+                            "text": cell['text'],
+                            "confidence": cell.get('confidence', 100),
+                            "rowspan": cell['rowspan'],
+                            "colspan": cell['colspan']
+                        }
+                        row_data["cells"].append(cell_data)
+                    else:
+                        cell_data = {
+                            "value": cell['text'],
+                            "rowspan": cell['rowspan'],
+                            "colspan": cell['colspan']
+                        }
+                        row_data.append(cell_data)
+                else:
+                    # Regular cell
+                    if include_confidence:
+                        cell_data = {
+                            "text": cell['text'],
+                            "confidence": cell.get('confidence', 100)
+                        }
+                        row_data["cells"].append(cell_data)
+                    else:
+                        row_data.append(cell['text'])
+            
+            # Only add non-empty rows
+            if include_confidence:
+                if any(cell for cell in row_data["cells"] if cell):
+                    table_data["rows"].append(row_data)
+            else:
+                if any(cell for cell in row_data if cell):
+                    table_data["rows"].append(row_data)
+        
+        llm_json["tables"].append(table_data)
+    
+    return llm_json
