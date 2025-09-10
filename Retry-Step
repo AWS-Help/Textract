@@ -6,6 +6,7 @@ If it gets HTTP 429, add a small random delay before throwing a 429Error excepti
 Return the API response if successful.
 
 Example Python code:
+-------------------------------------------------------------------------------------
 import requests
 import random
 import time
@@ -24,10 +25,12 @@ def handler(event, context):
         raise Exception("429Error")
     # Return the API response as JSON
     return resp.json()
+-------------------------------------------------------------------------------------
 
 2. Update Step Functions State Definition
 Modify the Task state that calls the Lambda to include a Retry block:
 
+-------------------------------------------------------------------------------------
 "CallGenAIGateway": {
   "Type": "Task",
   "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:YOUR_LAMBDA_NAME",
@@ -48,6 +51,7 @@ Modify the Task state that calls the Lambda to include a Retry block:
   ],
   "Next": "NextStep"
 }
+-------------------------------------------------------------------------------------
 
 Explanation:
 IntervalSeconds: 15 → first retry waits 15s.
