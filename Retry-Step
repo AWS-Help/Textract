@@ -1,0 +1,65 @@
+1. Modify Lambda Function
+Your Lambda should:
+
+Call the Gen AI Gateway API.
+
+If it gets HTTP 429, add a small random delay before throwing a 429Error exception.
+
+Return the API response if successful.
+
+Example Python code:
+
+
+
+import requests
+import random
+import time
+def handler(event, context):
+    # Small random jitter to avoid hitting rate limits at the same time
+    time.sleep(random.uniform(0.5, 2.0))
+    url = "https://gen-ai-gateway/api"  # Replace with actual API endpoint
+    payload = event  # Assuming event contains required request payload
+    resp = requests.post(url, json=payload)
+    if resp.status_code == 429:
+        # Optional: if Retry-After header exists, use it to wait longer
+        retry_after = int(resp.headers.get("Retry-After", "0"))
+        if retry_after > 0:
+            time.sleep(retry_after)
+        # Throw a custom error Step Functions can catch
+        raise Exception("429Error")
+    # Return the API response as JSON
+    return resp.json()
+2. Update Step Functions State Definition
+Modify the Task state that calls the Lambda to include a Retry block:
+
+
+
+"CallGenAIGateway": {
+  "Type": "Task",
+  "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:YOUR_LAMBDA_NAME",
+  "Retry": [
+    {
+      "ErrorEquals": ["429Error"],
+      "IntervalSeconds": 15,
+      "BackoffRate": 2.5,
+      "MaxAttempts": 4
+    }
+  ],
+  "Catch": [
+    {
+      "ErrorEquals": ["States.ALL"],
+      "ResultPath": "$.errorInfo",
+      "Next": "HandleFailure"
+    }
+  ],
+  "Next": "NextStep"
+}
+Explanation:
+
+IntervalSeconds: 15 → first retry waits 15s.
+
+BackoffRate: 2.5 → next waits are multiplied (15 → 37.5 → 93.75).
+
+MaxAttempts: 4 → max total tries before failure.
+
+Catch ensures you handle failure gracefully.
