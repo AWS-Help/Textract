@@ -1,0 +1,83 @@
+import boto3
+import time
+import json
+from botocore.exceptions import ClientError
+
+class TextractDocumentProcessor:
+    def __init__(self, region_name='us-east-2'):
+        self.region_name = region_name
+        try:
+            self.textract_client = boto3.client('textract', region_name=region_name)
+        except Exception as e:
+            print(f"Error initializing Textract client: {e}")
+            self.textract_client = None
+
+    def extract_text_async_with_pages(self, bucket_name, document_key):
+        if not self.textract_client:
+            return {'success': False, 'error': 'Textract client not initialized'}
+
+        try:
+            start_response = self.textract_client.start_document_text_detection(
+                DocumentLocation={'S3Object': {'Bucket': bucket_name, 'Name': document_key}}
+            )
+            job_id = start_response['JobId']
+
+            max_attempts = 60
+            for attempt in range(max_attempts):
+                response = self.textract_client.get_document_text_detection(JobId=job_id)
+                status = response['JobStatus']
+                if status == 'SUCCEEDED':
+                    all_blocks = response['Blocks']
+                    while 'NextToken' in response:
+                        response = self.textract_client.get_document_text_detection(JobId=job_id, NextToken=response['NextToken'])
+                        all_blocks.extend(response['Blocks'])
+
+                    # Organize text by page
+                    pages = {}
+                    for block in all_blocks:
+                        if block['BlockType'] == 'LINE':
+                            page = block['Page']
+                            if page not in pages:
+                                pages[page] = []
+                            pages[page].append(block['Text'])
+
+                    # Prepare JSON output
+                    result_json = []
+                    for page_num in sorted(pages.keys()):
+                        result_json.append({
+                            'page': page_num,
+                            'lines': pages[page_num]
+                        })
+
+                    return {'success': True, 'result': result_json}
+
+                elif status == 'FAILED':
+                    return {'success': False, 'error': 'Textract job failed'}
+
+                time.sleep(5)
+
+            return {'success': False, 'error': 'Textract job timed out'}
+
+        except ClientError as e:
+            return {'success': False, 'error': f'Textract error: {str(e)}'}
+
+def main():
+    BUCKET_NAME = 'testbk234123'
+    DOCUMENT_KEY = '1.pdf'
+
+    processor = TextractDocumentProcessor(region_name='us-east-2')
+    result = processor.extract_text_async_with_pages(BUCKET_NAME, DOCUMENT_KEY)
+
+    if result['success']:
+        json_output = json.dumps(result['result'], indent=4)
+        print('Extracted JSON output:')
+        print(json_output)
+
+        with open('extracted_text_with_pages.json', 'w', encoding='utf-8') as f:
+            f.write(json_output)
+        print('Saved JSON output to extracted_text_with_pages.json')
+    else:
+        print(f"Error: {result['error']}")
+
+if __name__ == '__main__':
+    main()
