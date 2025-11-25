@@ -1,59 +1,75 @@
-Carefully analyze the floor plan image meticulously to identify all restroom areas (Male, Female, Unisex, Accessible/Disabled).
+Enterprise Document Intelligence: AI Review Board Flow
 
-Important: Restrooms may be depicted in various ways in floor plans. Look for:
-- Standard bathroom symbols (toilet icons, urinal shapes)
-- Text labels (WC, Restroom, Toilet, Lavatory, Men, Women, M, W, etc.)
-- Fixture arrangements (rows of stalls, urinals, sinks along walls)
-- Accessibility symbols (wheelchair icons)
-- Room shapes and sizes typical of restrooms (small rectangular rooms near common areas)
-- Plumbing fixtures (water supply lines shown as small circles near walls)
-- Door swing patterns (inward-opening doors for privacy)
-- Proximity to other typical adjacent spaces (janitor closets, water fountains)
-- Notation systems (hatching patterns or color codes specific to the floor plan)
-- Abbreviations (RR, T, WR, BR, etc.)
+Objective: Securely process unstructured financial documents with auditable, high-precision data extraction to reduce manual review time and ensure compliance.
 
-Identify all restroom areas, even those without explicit text labels or using unconventional notation.
+High-Level Process Overview
 
-Output your findings only as a single JSON object. This object should contain one key: "restrooms".
+This pipeline operates in five distinct, auditable phases, separating the tasks of ingestion, classification, logic, and extraction.
 
-The value of "restrooms" should be a JSON list, where each element in the list is an object representing one identified restroom area.
+Detailed Governance and Safety Flow
 
-Each restroom object must contain the following keys:
+Phase
 
-"type": (String) The identified type (e.g., "Male", "Female", "Accessible", "Unisex"). If the type cannot be determined, use "Unspecified" and explain why in the notes field.
-"location_description": (String) A brief textual description of its location (e.g., "Near main entrance, west wing").
-"confidence": (String) The model's qualitative confidence in this identification ("High", "Medium", or "Low").
-"identification_basis": (String) How it was identified ("Symbol", "Text Label", "Context/Layout", "Fixture Arrangement", "Plumbing Notation", or other relevant basis).
-"symbol_description": (String) If identified by a symbol, describe the specific symbol observed (e.g., "Standard toilet icon", "Male stick figure", "Wheelchair accessibility symbol"). If not identified by a symbol, state "No symbol used".
-"interior_features": (Object) A description of what's visible inside the restroom area, with the following sub-keys:
-    "cubicles": (Integer or String) The number of toilet cubicles/stalls visible, or "Unclear" if not distinguishable.
-    "sinks": (Integer or String) The number of sinks visible, or "Unclear" if not distinguishable.
-    "urinals": (Integer or String) The number of urinals visible (typically in male restrooms), or "None" if none are visible, or "Unclear" if not distinguishable.
-    "showers": (Integer or String) The number of shower fixtures visible, or "None" if none are visible, or "Unclear" if not distinguishable.
-    "bathtubs": (Integer or String) The number of bathtubs visible, or "None" if none are visible, or "Unclear" if not distinguishable.
-    "other_fixtures": (Array of Strings) Any other notable fixtures or features visible inside the restroom (e.g., ["Baby changing station", "Hand dryer"]), or empty array if none are clearly visible.
-    "total_features_count": (Integer or String) The total count of all interior features identified, even if individual counts are unclear. Provide your best estimate or "Unclear" if completely indistinguishable.
-"notes": (String) Any additional observations or clarifications about this restroom, including why the type might be unspecified or any ambiguities in the identification.
+Description (Key Function)
 
-Example of a single restroom object within the list:
-{
-  "type": "Female",
-  "location_description": "Second floor, near elevator bank B",
-  "confidence": "High",
-  "identification_basis": "Symbol and Fixture Arrangement",
-  "symbol_description": "Female stick figure icon with dress",
-  "interior_features": {
-    "cubicles": 3,
-    "sinks": 2,
-    "urinals": "None",
-    "showers": "None",
-    "bathtubs": "None",
-    "other_fixtures": ["Baby changing station"],
-    "total_features_count": 6
-  },
-  "notes": "Clearly marked as women's restroom with female symbol and multiple stalls visible."
-}
+Core Technology
 
-If no restrooms are found, return a JSON object like: {"restrooms": []}.
+Key Governance / Safety Check
 
-Please provide only the JSON object in your response.
+1. Ingestion & Triage
+
+Converts the raw PDF into machine-readable text blocks (OCR). Scans the page for structural elements (e.g., tables, charts).
+
+AWS Textract, PyMuPDF
+
+Data Lineage: Full trace from raw document to initial data blocks. Data Security: Processing occurs within a secure, private cloud perimeter.
+
+2. Classification & Indexing
+
+Mathematically classifies every page based on vector similarity to a library of pre-approved semantic phrases/keywords (categories.json). The text is indexed into the RAG database.
+
+Sentence-Transformers, OpenSearch (k-NN)
+
+Deterministic Classification: Based on a mathematical vector score, ensuring predictability and no LLM interpretation of document type.
+
+3. Intelligent Segmentation
+
+Uses LangGraph to apply rule-based segmentation. It monitors pre-defined Business Key changes (e.g., Lender Name) to create auditable, legally distinct document segments.
+
+LangGraph, Gemini 2.5 Flash
+
+Auditable Rules: Segmentation boundaries are based on explicit policy (Phase 3 logic), not arbitrary AI decisions. Control Plane: LangGraph acts as the central workflow manager.
+
+4. Fact Extraction & Validation
+
+Runs Hybrid Search to retrieve only evidence chunks. Gemini 2.5 Flash fills a pre-defined JSON schema (automated_entities.json) using only this verified context.
+
+OpenSearch (Hybrid Search), Gemini 2.5 Flash/Pro
+
+Constrained LLM: LLM is a "Structured Data Parser" for a fixed schema, not a generative writer. HITL Gateway: Low-confidence extractions are automatically flagged for mandatory human review.
+
+5. Synthesis & Reporting
+
+Generates a concise summary by fusing structured facts with original context. Final output is indexed with full citation links.
+
+Gemini 2.5 Flash, OpenSearch
+
+Full Audit Trail: Final data includes direct citation links (page number/chunk ID) for every fact, making the entire process verifiable.
+
+Key Governance Takeaways for the Board (Short Version)
+
+1. Controlled LLM Use
+
+No Free Writing: The LLM's role is strictly limited to filling a fixed JSON schema or consolidating conflicting values.
+
+No Full Document Access: The LLM never receives the complete document. It only receives verified context chunks retrieved from our internal RAG index.
+
+Secure Gateway: All LLM communication is routed through a secure GenAI Gateway for auditing and rate control.
+
+2. Safety and Predictability
+
+Deterministic Classification: Document type is determined by a mathematical vector score, ensuring predictability and auditability, independent of the LLM.
+
+Policy-Driven Logic: Segmentation (Phase 3) is based on pre-defined business rules (e.g., a change in BorrowerName), not arbitrary AI logic.
+
+Human-in-the-Loop (HITL): A quantitative confidence score flags uncertain extractions for mandatory human oversight.
